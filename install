@@ -1,0 +1,483 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Universal YNAB 4 converter for macOS
+# Replaces the captive AIR 4 runtime with AIR 51.3.1.2
+# and rebuilds the legacy native extensions as universal shims.
+
+APP_FILE="YNAB4_LiveCaptive_4.3.855.dmg"
+APP_SHA256="05dd388122e49a131c76adf265620b2fafac589f9b92ad8b622720e0752a1eb6"
+AIR_FILE="AdobeAIR.dmg"
+AIR_SHA256="48006e4d0acccbcd8ffa6487c57ca76c432a2fab5d3425da4b19209581435a41"
+AIR_VERSION="51.3.1.2"
+AIR_SHORT_VERSION="51.3"
+APP_NAME="YNAB 4.app"
+APP_EXECUTABLE="YNAB 4"
+
+declare -a APP_URLS=(
+    "https://web.archive.org/web/20190613044706/https://classic.youneedabudget.com/CDNOrigin/download/ynab4/liveCaptive/Mac/YNAB4_LiveCaptive_4.3.855.dmg"
+)
+
+declare -a AIR_URLS=(
+    "https://airsdk.harman.com/assets/downloads/${AIR_VERSION}/AdobeAIR.dmg"
+)
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SOURCES_DIR="$SCRIPT_DIR/src/air51"
+SYSTEM_TMPDIR="${TMPDIR:-/tmp}"
+TMPDIR="$(mktemp -d "${SYSTEM_TMPDIR%/}/ynab4-air51.XXXXXX")"
+INSTALLDIR=""
+
+declare -a MOUNT_POINTS=()
+
+cleanup() {
+    local mount_point
+
+    # Always detach any mounted DMGs so repeated runs do not leave stale volumes behind.
+    for mount_point in "${MOUNT_POINTS[@]-}"; do
+        if [[ -n "$mount_point" && -d "$mount_point" ]]; then
+            hdiutil detach "$mount_point" -force >/dev/null 2>&1 || true
+        fi
+    done
+
+    # Build artifacts live in a temp workspace and should not pollute the repo.
+    if [[ -n "$TMPDIR" && -d "$TMPDIR" ]]; then
+        rm -rf "$TMPDIR"
+    fi
+}
+
+trap cleanup EXIT
+
+die() {
+    echo "$*" 1>&2
+    exit 1
+}
+
+require_file() {
+    local path="$1"
+    [[ -f "$path" ]] || die "> Missing required file: $path"
+}
+
+require_command() {
+    local command_name="$1"
+    command -v "$command_name" >/dev/null 2>&1 || die "> Required command not found: $command_name"
+}
+
+verify_sha256() {
+    local path="$1"
+    local expected_sha="$2"
+    local actual_sha
+
+    actual_sha="$(shasum -a 256 "$path" | awk '{print $1}')"
+    [[ "$actual_sha" == "$expected_sha" ]]
+}
+
+resolve_dependency() {
+    local file_name="$1"
+    local expected_sha="$2"
+    local local_path="$SCRIPT_DIR/$file_name"
+    local download_path="$TMPDIR/$file_name"
+    local partial_path="$download_path.partial"
+    local url
+
+    shift 2
+
+    # Reuse a verified local copy when possible so repeat runs are fast and offline-friendly.
+    if [[ -f "$local_path" ]]; then
+        if verify_sha256 "$local_path" "$expected_sha"; then
+            echo "> Reusing verified local '$file_name'" >&2
+            printf '%s\n' "$local_path"
+            return 0
+        fi
+
+        echo "> Ignoring local '$file_name' because its SHA-256 checksum does not match the expected file" >&2
+    fi
+
+    rm -f "$download_path" "$partial_path"
+
+    for url in "$@"; do
+        echo "> Downloading '$file_name'" >&2
+        echo "> Source: $url" >&2
+
+        # Download to a temporary file first so an interrupted fetch never looks valid.
+        if curl --fail --location --retry 3 --retry-delay 1 --silent --show-error \
+            --output "$partial_path" "$url"; then
+            mv "$partial_path" "$download_path"
+
+            if verify_sha256 "$download_path" "$expected_sha"; then
+                printf '%s\n' "$download_path"
+                return 0
+            fi
+
+            echo "> Downloaded '$file_name' but the SHA-256 checksum did not match" >&2
+        fi
+
+        rm -f "$download_path" "$partial_path"
+    done
+
+    die "> Failed to fetch a valid copy of '$file_name'"
+}
+
+attach_dmg() {
+    local dmg_path="$1"
+    local mount_point
+
+    # Mount read-only because the source DMGs are only used as extraction inputs.
+    mount_point="$(
+        hdiutil attach -nobrowse -readonly "$dmg_path" \
+            | awk 'BEGIN { FS = "\t" } /\/Volumes\// { print $3; exit }'
+    )"
+
+    [[ -n "$mount_point" ]] || die "> Failed to mount: $dmg_path"
+    MOUNT_POINTS+=("$mount_point")
+    printf '%s\n' "$mount_point"
+}
+
+create_framework_bundle() {
+    local framework_name="$1"
+    local binary_path="$2"
+    local framework_dir="$3"
+    local bundle_identifier="$4"
+
+    # The rebuilt ANEs need a minimal, modern framework bundle layout.
+    mkdir -p "$framework_dir/Versions/A/Resources"
+    mv "$binary_path" "$framework_dir/Versions/A/$framework_name"
+
+    ln -sfn A "$framework_dir/Versions/Current"
+    ln -sfn "Versions/Current/$framework_name" "$framework_dir/$framework_name"
+    ln -sfn "Versions/Current/Resources" "$framework_dir/Resources"
+
+    cat >"$framework_dir/Versions/A/Resources/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>${framework_name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>${bundle_identifier}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>${framework_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+</dict>
+</plist>
+EOF
+}
+
+build_framework() {
+    local framework_name="$1"
+    local source_file="$2"
+    local framework_dir="$3"
+    local bundle_identifier="$4"
+    local build_binary="$TMPDIR/$framework_name"
+
+    # Rebuild the old Intel-only ANE payloads as tiny universal shims.
+    clang \
+        -arch x86_64 \
+        -arch arm64 \
+        -mmacosx-version-min=10.13 \
+        -fobjc-arc \
+        -dynamiclib \
+        -Wl,-undefined,dynamic_lookup \
+        -framework Foundation \
+        -framework AppKit \
+        -I "$SOURCES_DIR" \
+        -install_name "@rpath/${framework_name}.framework/Versions/A/${framework_name}" \
+        "$source_file" \
+        -o "$build_binary"
+
+    create_framework_bundle "$framework_name" "$build_binary" "$framework_dir" "$bundle_identifier"
+}
+
+build_helper_tool() {
+    local source_file="$1"
+    local output_path="$2"
+
+    # AIR 51 still probes for this captive-launch helper even though it no longer ships it.
+    clang \
+        -arch x86_64 \
+        -arch arm64 \
+        -mmacosx-version-min=10.13 \
+        "$source_file" \
+        -o "$output_path"
+
+    chmod 755 "$output_path"
+}
+
+patch_launcher_to_captive_mode() {
+    local executable_path="$1"
+    local thin_dir="$TMPDIR/launcher-thin"
+    local x86_binary="$thin_dir/x86_64"
+    local arm_binary="$thin_dir/arm64"
+
+    rm -rf "$thin_dir"
+    mkdir -p "$thin_dir"
+
+    # Patch the stock AIR 51 launcher template back to the captive entrypoint/mode that YNAB expects.
+    lipo "$executable_path" -thin x86_64 -output "$x86_binary"
+    lipo "$executable_path" -thin arm64 -output "$arm_binary"
+
+    python3 - "$x86_binary" "$arm_binary" <<'PY'
+from pathlib import Path
+import sys
+
+old_selector = b"extendedAppEntryMain:"
+new_selector = b"captiveAppEntryMain:\x00"
+x86_old_mode = b"\xbe\x08\x00\x00\x00"
+x86_new_mode = b"\xbe\x02\x00\x00\x00"
+arm_old_mode = b"\x01\x01\x80\x52"
+arm_new_mode = b"\x41\x00\x80\x52"
+
+def patch_binary(path: Path, old_mode: bytes, new_mode: bytes) -> None:
+    data = path.read_bytes()
+
+    selector_count = data.count(old_selector)
+    if selector_count != 1:
+        raise SystemExit(f"Expected exactly one launcher selector marker in {path}, found {selector_count}")
+
+    mode_count = data.count(old_mode)
+    if mode_count != 1:
+        raise SystemExit(f"Expected exactly one launcher mode marker in {path}, found {mode_count}")
+
+    data = data.replace(old_selector, new_selector, 1)
+    data = data.replace(old_mode, new_mode, 1)
+    path.write_bytes(data)
+
+patch_binary(Path(sys.argv[1]), x86_old_mode, x86_new_mode)
+patch_binary(Path(sys.argv[2]), arm_old_mode, arm_new_mode)
+PY
+
+    lipo -create -output "$executable_path" "$x86_binary" "$arm_binary"
+}
+
+patch_air_runtime_authorization() {
+    local runtime_binary="$1"
+    local thin_dir="$TMPDIR/runtime-thin"
+    local x86_binary="$thin_dir/x86_64"
+    local arm_binary="$thin_dir/arm64"
+
+    rm -rf "$thin_dir"
+    mkdir -p "$thin_dir"
+
+    # AIR still contains a legacy privileged-helper install path that only causes an unnecessary
+    # password prompt on modern macOS. Patch that path to return "cancelled" immediately.
+    lipo "$runtime_binary" -thin x86_64 -output "$x86_binary"
+    lipo "$runtime_binary" -thin arm64 -output "$arm_binary"
+
+    python3 - "$x86_binary" "$arm_binary" <<'PY'
+from pathlib import Path
+import sys
+
+X86_OFFSET = 0x28E344
+ARM_OFFSET = 0x24DCD0
+X86_PATCH = bytes.fromhex("b89a15ffffc3")
+ARM_PATCH = bytes.fromhex("40b38252e0ffbf72c0035fd6")
+X86_NOP = 0x90
+ARM_NOP = bytes.fromhex("1f2003d5")
+
+def patch_x86(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[X86_OFFSET:X86_OFFSET + len(X86_PATCH)] = X86_PATCH
+    for index in range(X86_OFFSET + len(X86_PATCH), X86_OFFSET + 16):
+        data[index] = X86_NOP
+    path.write_bytes(data)
+
+def patch_arm(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[ARM_OFFSET:ARM_OFFSET + len(ARM_PATCH)] = ARM_PATCH
+    for index in range(ARM_OFFSET + len(ARM_PATCH), ARM_OFFSET + 16, 4):
+        data[index:index + 4] = ARM_NOP
+    path.write_bytes(data)
+
+patch_x86(Path(sys.argv[1]))
+patch_arm(Path(sys.argv[2]))
+PY
+
+    lipo -create -output "$runtime_binary" "$x86_binary" "$arm_binary"
+}
+
+patch_extension() {
+    local extension_root="$1"
+    local framework_name="$2"
+    local source_file="$3"
+    local bundle_identifier="$4"
+    local extension_xml="$extension_root/META-INF/ANE/extension.xml"
+    local legacy_platform_dir="$extension_root/META-INF/ANE/MacOS-x86"
+    local universal_platform_dir="$extension_root/META-INF/ANE/MacOS-x86-64"
+    local framework_dir="$universal_platform_dir/${framework_name}.framework"
+
+    # AIR 51 expects the 64-bit ANE platform directory name instead of the old MacOS-x86 layout.
+    sed -i '' 's/MacOS-x86/MacOS-x86-64/g' "$extension_xml"
+
+    if [[ -d "$universal_platform_dir" ]]; then
+        rm -rf "$universal_platform_dir"
+    fi
+    mv "$legacy_platform_dir" "$universal_platform_dir"
+
+    rm -rf "$framework_dir"
+    build_framework "$framework_name" "$source_file" "$framework_dir" "$bundle_identifier"
+}
+
+prepare_app_bundle() {
+    local app_dir="$1"
+    local air_volume="$2"
+    local helper_tool_path="$app_dir/Contents/Frameworks/Adobe AIR.framework/Versions/1.0/Resources/A2712Enabler"
+    local runtime_binary="$app_dir/Contents/Frameworks/Adobe AIR.framework/Versions/1.0/Adobe AIR"
+
+    rm -rf "$app_dir/Contents/Frameworks/Adobe AIR.framework"
+    ditto \
+        "$air_volume/Adobe AIR Installer.app/Contents/Frameworks/Adobe AIR.framework" \
+        "$app_dir/Contents/Frameworks/Adobe AIR.framework"
+
+    # Start from AIR's universal launcher template, then patch it into YNAB's captive mode.
+    ditto \
+        "$air_volume/Adobe AIR Installer.app/Contents/Frameworks/Adobe AIR.framework/Versions/1.0/Resources/ExtendedAppEntryTemplate64" \
+        "$app_dir/Contents/MacOS/$APP_EXECUTABLE"
+    patch_launcher_to_captive_mode "$app_dir/Contents/MacOS/$APP_EXECUTABLE"
+    patch_air_runtime_authorization "$runtime_binary"
+    chmod 755 "$app_dir/Contents/MacOS/$APP_EXECUTABLE"
+    build_helper_tool "$SOURCES_DIR/A2712Enabler.c" "$helper_tool_path"
+
+    plutil -replace LSMinimumSystemVersion -string "10.13" "$app_dir/Contents/Info.plist"
+    plutil -remove LSRequiresCarbon "$app_dir/Contents/Info.plist" || true
+
+    patch_extension \
+        "$app_dir/Contents/Resources/META-INF/AIR/extensions/mac" \
+        "MacUtilsNativeExtension" \
+        "$SOURCES_DIR/macutils_shim.m" \
+        "com.ynab.air51.macutils"
+
+    patch_extension \
+        "$app_dir/Contents/Resources/META-INF/AIR/extensions/sparkle" \
+        "SparkleNativeExtension" \
+        "$SOURCES_DIR/sparkle_shim.m" \
+        "com.ynab.air51.sparkle"
+
+    # Remove stale nested signatures and re-sign the rebuilt bundle as one coherent app.
+    find "$app_dir" -name '_CodeSignature' -type d -prune -exec rm -rf {} +
+    find "$app_dir" -exec xattr -c {} + >/dev/null 2>&1 || true
+
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --deep --sign - "$app_dir" >/dev/null 2>&1 || \
+            echo "> Warning: ad-hoc signing failed; you may need to launch the app with Right Click > Open."
+    fi
+}
+
+install_app() {
+    local app_dmg
+    local air_dmg
+    local app_volume
+    local air_volume
+    local app_dir="$TMPDIR/$APP_NAME"
+
+    require_file "$SOURCES_DIR/A2712Enabler.c"
+    require_file "$SOURCES_DIR/FlashRuntimeExtensions.h"
+    require_file "$SOURCES_DIR/macutils_shim.m"
+    require_file "$SOURCES_DIR/sparkle_shim.m"
+
+    require_command awk
+    require_command clang
+    require_command codesign
+    require_command curl
+    require_command ditto
+    require_command hdiutil
+    require_command lipo
+    require_command python3
+    require_command plutil
+    require_command shasum
+    require_command xattr
+
+    # Inputs can come from verified local caches or fresh downloads.
+    app_dmg="$(resolve_dependency "$APP_FILE" "$APP_SHA256" "${APP_URLS[@]}")"
+    air_dmg="$(resolve_dependency "$AIR_FILE" "$AIR_SHA256" "${AIR_URLS[@]}")"
+
+    echo "> Mounting '$APP_FILE'"
+    app_volume="$(attach_dmg "$app_dmg")"
+
+    echo "> Extracting '$APP_NAME'"
+    ditto "$app_volume/$APP_NAME" "$app_dir"
+
+    echo "> Mounting '$AIR_FILE'"
+    air_volume="$(attach_dmg "$air_dmg")"
+
+    echo "> Replacing the captive Adobe AIR runtime with AIR $AIR_VERSION"
+    prepare_app_bundle "$app_dir" "$air_volume"
+
+    # Deliver the finished app in its own folder so Finder can reveal it cleanly.
+    INSTALLDIR="$(mktemp -d "${SYSTEM_TMPDIR%/}/ynab4-output.XXXXXX")"
+    [[ -d "$INSTALLDIR" ]] || die "> Failed to create output directory"
+
+    mv "$app_dir" "$INSTALLDIR/$APP_NAME"
+    ln -s "/Applications" "$INSTALLDIR/Applications"
+    touch "$INSTALLDIR/DRAG APP TO APPLICATIONS DIR"
+}
+
+print_banner() {
+    echo "=========================================================="
+    cat <<'EOF'
+    ██╗   ██╗███╗   ██╗ █████╗ ██████╗     ██╗  ██╗
+    ╚██╗ ██╔╝████╗  ██║██╔══██╗██╔══██╗    ██║  ██║
+     ╚████╔╝ ██╔██╗ ██║███████║██████╔╝    ███████║
+      ╚██╔╝  ██║╚██╗██║██╔══██║██╔══██╗    ╚════██║
+       ██║   ██║ ╚████║██║  ██║██████╔╝         ██║
+       ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═════╝          ╚═╝
+EOF
+    echo "=========================================================="
+    echo "===       YNAB 4 converter to Universal binary       ====="
+    echo "=========================================================="
+    echo "> This script will:"
+    echo "> 1. Reuse verified local DMGs if present, otherwise download them automatically"
+    echo "> 2. Fetch YNAB 4 and Adobe AIR $AIR_VERSION with checksum verification"
+    echo "> 3. Replace the captive AIR runtime with AIR $AIR_VERSION"
+    echo "> 4. Patch the AIR launcher/runtime for modern macOS compatibility"
+    echo "> 5. Rebuild the legacy native extensions as universal shims"
+    echo "> 6. Save the converted app in a folder you can drag to /Applications"
+    echo "=========================================================="
+    cat <<'EOF'
+IMPORTANT NOTE: This script is not affiliated with
+YNAB in any way and YNAB has not endorsed it.
+You Need a Budget and YNAB are registered
+trademarks of You Need A Budget LLC.
+
+The Sparkle updater integration is intentionally
+stubbed out because YNAB 4's old update flow no
+longer applies to the rebuilt runtime.
+EOF
+    echo "=========================================================="
+}
+
+main() {
+    print_banner
+    read -r -p "Press [ENTER] to continue or [CTRL+C] to cancel"
+
+    install_app
+
+    echo "=========================================================="
+    cat <<EOF
+                   _                  _
+                  | |                | |
+                __| | ___  _ __   ___| |
+               / _  |/ _ \|  _ \ / _ \ |
+              | (_| | (_) | | | |  __/_|
+               \__,_|\___/|_| |_|\___(_)
+EOF
+    echo "=========================================================="
+    echo "> The rebuilt app has been saved to:"
+    echo "> \"$INSTALLDIR\""
+    echo "> Drag '$APP_NAME' to /Applications to install it"
+    echo "=========================================================="
+
+    read -r -p "Press [ENTER] to reveal the rebuilt app"
+    open -R "$INSTALLDIR/$APP_NAME"
+    echo "> Done!"
+}
+
+main "$@"
