@@ -1,6 +1,9 @@
 > [!CAUTION]
 > The current AIR 51 / Apple Silicon compatibility rewrite in this repository was produced entirely by GPT-5.4. Neither GPT-5.4 nor the original author is responsible for any damage or data loss that may result from using this tool.
 
+> [!TIP]
+> There is now an iOS YNAB Classic app modernizer patch located in my other repository @newkind/ynab-classic-ios-modernizer Please note that you have to supply your own **decrypted** IPA file for it to work.
+
 # YNAB 4 Universal (Intel & Apple Silicon) Binary Converter for macOS
 
 YNAB 4 originally shipped with an old Intel-era captive Adobe AIR runtime. That approach survived the 32-bit transition, but it still leaves the app dependent on Rosetta 2 on Apple Silicon Macs. As Apple continues moving away from Intel compatibility, that is not a stable long-term path for keeping YNAB 4 usable.
@@ -50,6 +53,7 @@ The updated workflow:
 8. Ad-hoc signs the rebuilt app to avoid stale nested signatures
 
 ## Limitations
+
 - Will not work with App Store-purchased licenses unless you have received a separate license key. Refer to YNAB's [Mac App Store FAQ](https://web.archive.org/web/20170817002804/https://classic.youneedabudget.com/support/article/mac-app-store-faq).
 - The `Check for Updates` function does not work. The Sparkle integration is intentionally stubbed.
 - The script depends on `clang`, `curl`, `python3`, and `shasum`. `clang` is provided by the Xcode Command Line Tools.
@@ -59,6 +63,7 @@ The updated workflow:
 You may still be able to run older YNAB 4 builds through virtualization or compatibility layers, but this project exists specifically to avoid relying on Rosetta 2 for the macOS app.
 
 ## Legal Stuff
+
 **IMPORTANT NOTE:** This shell script is not affiliated with YNAB in any way, and YNAB has not endorsed it. You Need a Budget and YNAB are registered trademarks of You Need a Budget LLC and/or one of its subsidiaries.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
