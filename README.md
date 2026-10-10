@@ -2,7 +2,7 @@
 > The current AIR 51 / Apple Silicon compatibility rewrite in this repository was produced entirely by GPT-5.4. Neither GPT-5.4 nor the original author is responsible for any damage or data loss that may result from using this tool.
 
 > [!TIP]
-> There is now an iOS YNAB Classic app modernizer patch located in my other repository @newkind/ynab-classic-ios-modernizer Please note that you have to supply your own **decrypted** IPA file for it to work.
+> There is now an iOS YNAB Classic app modernizer patch located in my other repository [newkind/ynab-classic-ios-modernizer](https://github.com/newkind/ynab-classic-ios-modernizer) Please note that you have to supply your own **decrypted** IPA file for it to work.
 
 # YNAB 4 Universal (Intel & Apple Silicon) Binary Converter for macOS
 
